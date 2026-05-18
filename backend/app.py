@@ -5,7 +5,8 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from dotenv import load_dotenv
 from supabase import create_client, Client
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import resend
 
 # Load environment variables
@@ -27,100 +28,12 @@ if supabase_url and supabase_key and supabase_url != "your_supabase_url":
 
 # Initialize Gemini client
 gemini_api_key = os.getenv("GEMINI_API_KEY", "")
+gemini_client = None
 if gemini_api_key and gemini_api_key != "your_gemini_api_key":
-    genai.configure(api_key=gemini_api_key)
+    gemini_client = genai.Client(api_key=gemini_api_key)
 
 # Initialize Resend client for sending emails
 resend.api_key = os.getenv("RESEND_API_KEY", "")
-
-def build_fallback_summary(message, service):
-    clean_message = " ".join((message or "").split()).strip()
-    service_text = (service or "").strip()
-
-    if clean_message:
-        snippet = clean_message[:180]
-        if len(clean_message) > 180:
-            snippet += "..."
-        if service_text:
-            return f"Client requested help with {service_text}. {snippet}"
-        return f"Client inquiry: {snippet}"
-
-    if service_text:
-        return f"Client requested help with {service_text}."
-    return "Client submitted an inquiry."
-
-def normalize_domain_keyword(value):
-    raw = (value or "").strip()
-    if not raw:
-        return "General"
-
-    normalized = re.sub(r"\s+", " ", raw.replace("_", " ").replace("-", " ")).strip()
-    lowered = normalized.lower()
-
-    if lowered == "ai ml":
-        return "AI/ML"
-    if lowered == "erp lms":
-        return "ERP/LMS"
-
-    return normalized.title() if normalized else "General"
-
-def build_short_summary_sentence(summary_text, message):
-    source = (summary_text or "").strip()
-
-    if source:
-        source = re.sub(r"^[A-Za-z][A-Za-z0-9/& \-]{1,40}:\s*", "", source).strip()
-
-    if not source:
-        source = " ".join((message or "").split()).strip()
-    if not source:
-        source = "Client needs assistance."
-
-    source = re.sub(r"\s+", " ", source).strip().rstrip(".!?")
-    source = re.sub(
-        r"^(?:the client|client)\s+(?:is\s+)?(?:seeking|looking for|needs|wants|requires|requested)\s+",
-        "",
-        source,
-        flags=re.IGNORECASE,
-    )
-    source = re.sub(
-        r"^(?:we|i|our team|our company|my team|my company)\s+(?:are\s+)?(?:looking for|seeking|need|want|require)\s+",
-        "",
-        source,
-        flags=re.IGNORECASE,
-    )
-    source = re.sub(
-        r"^(?:need|needs|want|wants|require|requires|looking for|seeking)\s+",
-        "",
-        source,
-        flags=re.IGNORECASE,
-    )
-
-    first_sentence = re.split(r"(?<=[.!?])\s+", source, maxsplit=1)[0].strip().rstrip(".!?")
-    if len(first_sentence) > 130:
-        first_sentence = first_sentence[:127].rstrip() + "..."
-    if not first_sentence:
-        first_sentence = "assistance with their requirement"
-
-    if first_sentence.endswith("..."):
-        return f"The client is seeking {first_sentence}"
-    return f"The client is seeking {first_sentence}."
-
-def build_domain_summary(category, service, summary_text, message):
-    domain_source = (service or "").strip() or (category or "").strip() or "General"
-    domain_keyword = normalize_domain_keyword(domain_source)
-    short_sentence = build_short_summary_sentence(summary_text, message)
-    return f"{domain_keyword}: {short_sentence}"
-
-def build_default_reply(name):
-    client_name = (name or "").strip() or "Client"
-    return (
-        f"Dear {client_name},\n\n"
-        "Thank you for reaching out to us.\n\n"
-        "We have received your inquiry successfully. One of our executives will review your requirements and get in touch with you shortly to assist you further.\n\n"
-        "We appreciate your interest and look forward to connecting with you.\n\n"
-        "Best regards,\n"
-        "Team Inquiro AI"
-    )
 
 def classify_inquiry(name, message, service):
     """
@@ -128,91 +41,66 @@ def classify_inquiry(name, message, service):
     summarize it, and write a personalized reply.
     """
     
-    # 1. Define fallback values in case the AI fails or the network drops.
+    # 1. Define clean fallback values in case the AI fails.
     category = "General"
-    summary = build_domain_summary(category, service, "", message)
-    reply = build_default_reply(name)
+    summary = "A new inquiry has been submitted by the client."
+    reply = (
+        f"Dear {name},\n\n"
+        "Thank you for reaching out to us.\n\n"
+        "We have received your inquiry successfully. One of our executives will review your requirements and get in touch with you shortly to assist you further.\n\n"
+        "Best regards,\n"
+        "Team Inquiro AI"
+    )
     
     if not gemini_api_key or gemini_api_key == "your_gemini_api_key":
-        return category, summary, reply
+        return category, "AI Summary disabled (API key missing).", reply
         
-    # 2. Build the prompt. This is the exact instruction we send to Gemini.
+    # 2. Build the prompt.
     prompt = f"""
-    You are an AI assistant for a software agency.
+    You are an expert AI assistant for a software agency.
     A client named '{name}' has sent the following inquiry regarding '{service}':
     "{message}"
 
-    Analyze this inquiry and return ONLY valid JSON with this schema:
+    Analyze this inquiry and return ONLY valid JSON with exactly this schema. Do not include markdown code blocks.
     {{
-      "category": "Choose exactly one of: web-development, mobile-app, marketing, erp-lms, ai-ml, General",
-      "summary": "One short sentence in indirect voice (third person), easy to grasp, describing what the client needs",
-      "reply": "A warm 3-4 sentence auto-reply email addressed to {name}"
+      "category": "Choose exactly one of: Web Development, Mobile App, Marketing, SEO, AI/ML, ERP/LMS, General",
+      "summary": "Write a professional 1-sentence summary of what the client wants. Do not just copy their message.",
+      "reply": "Write a professional, warm, and personalized 3-4 sentence auto-reply email addressed to {name}, directly addressing their specific request."
     }}
     """
     
     try:
-        # 3. Load the specific Gemini model we want to use.
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        # Enforce JSON output so Gemini doesn't add conversational text
+        response = gemini_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+            )
+        )
         
-        # 4. Send the prompt to the model and wait for the response.
-        response = model.generate_content(prompt)
-        
-        response_text = ""
-        try:
-            response_text = (response.text or "").strip()
-        except Exception:
-            response_text = ""
+        response_text = response.text.strip()
+        print("Raw Gemini Response:", response_text) # Helpful for debugging in the terminal
 
-        if not response_text:
-            extracted_parts = []
-            candidates = getattr(response, "candidates", None) or []
-            for candidate in candidates:
-                content = getattr(candidate, "content", None)
-                if not content:
-                    continue
-                parts = getattr(content, "parts", None) or []
-                for part in parts:
-                    part_text = getattr(part, "text", None)
-                    if part_text:
-                        extracted_parts.append(part_text)
-            response_text = "\n".join(extracted_parts).strip()
-
+        # Clean markdown if present just in case
         if response_text.startswith("```"):
             response_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", response_text, flags=re.DOTALL).strip()
 
-        parsed = None
-        try:
-            parsed = json.loads(response_text)
-        except Exception:
-            parsed = None
-
-        if isinstance(parsed, dict):
-            category = str(parsed.get("category", category)).strip() or category
-            summary = str(parsed.get("summary", summary)).strip() or summary
-            reply = str(parsed.get("reply", reply)).strip() or reply
-        else:
-            # Fallback for non-JSON responses
-            lines = response_text.split('\n')
-            for line in lines:
-                clean_line = line.strip()
-                normalized = clean_line.replace("**", "")
-                if normalized.upper().startswith("CATEGORY:"):
-                    category = normalized.split(":", 1)[1].strip() or category
-                elif normalized.upper().startswith("SUMMARY:"):
-                    summary = normalized.split(":", 1)[1].strip() or summary
-                elif normalized.upper().startswith("REPLY:"):
-                    reply = normalized.split(":", 1)[1].strip() or reply
-
-        summary = build_domain_summary(category, service, summary, message)
-        if not reply.strip():
-            reply = build_default_reply(name)
-                
-    except Exception as e:
-        print(f"Error calling Gemini API: {e}")
-        summary = build_domain_summary(category, service, "", message)
-        reply = build_default_reply(name)
+        # Parse JSON
+        parsed = json.loads(response_text)
         
-    # 8. Return all three values back to whoever called this function.
+        # Extract values
+        if parsed.get("category"):
+            category = parsed["category"].strip()
+        if parsed.get("summary"):
+            summary = parsed["summary"].strip()
+        if parsed.get("reply"):
+            reply = parsed["reply"].strip()
+            
+    except Exception as e:
+        print(f"Error parsing Gemini response: {e}")
+        # If Gemini fails, it will safely return the clean fallback values defined at the top
+        
     return category, summary, reply
 
 
